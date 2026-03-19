@@ -47,18 +47,34 @@ def script_url(k: str, v: str):
 
 
 def get_scripts_list(text: str):
-    scripts = text.split('e=>e+"."+')[1].split('[e]+"a.js"')[0]
-    try:
-        data = json.loads(scripts)
-    except json.decoder.JSONDecodeError:
-        # Find unquoted keys {key:"value"} and convert to {"key":"value"}
-        fixed_scripts = re.sub(r'([{,]\s*)([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:', r'\1"\2":', scripts)
-        try:
-            data = json.loads(fixed_scripts)
-        except json.decoder.JSONDecodeError as e:
-            raise Exception("Failed to parse scripts") from e
+    marker = '[e]+"a.js"'
+    pos = text.find(marker)
+    if pos == -1:
+        raise Exception("Could not find script chunk marker in page")
 
-    for k, v in data.items():
+    # Search backwards from marker to find the opening { of the dict
+    brace_count = 0
+    start = pos
+    for i in range(pos, -1, -1):
+        if text[i] == '}':
+            brace_count += 1
+        elif text[i] == '{':
+            brace_count -= 1
+            if brace_count == 0:
+                start = i
+                break
+
+    dict_str = text[start:pos + 1]  # include closing }
+
+    # Extract key:value pairs directly with regex to handle JS quirks (88e3, unquoted keys, etc.)
+    for m in re.finditer(r'([a-zA-Z_$][\w$]*|[\de.]+)\s*:\s*"([^"]*)"', dict_str):
+        k = m.group(1)
+        v = m.group(2)
+        # Resolve JS scientific notation like 88e3 -> 88000
+        try:
+            k = str(int(float(k)))
+        except ValueError:
+            pass
         yield script_url(k, f"{v}a")
 
 
@@ -205,15 +221,52 @@ def parse_vk_bytes(soup: bs4.BeautifulSoup) -> list[int]:
     return list(base64.b64decode(bytes(el, "utf-8")))
 
 
+def _rextr(s: str, begin: str, end: str, pos: int) -> str | None:
+    """Extract string between last occurrence of begin..end before pos."""
+    end_idx = s.rfind(end, 0, pos)
+    if end_idx < 0:
+        return None
+    begin_idx = s.rfind(begin, 0, end_idx)
+    if begin_idx < 0:
+        return None
+    return s[begin_idx + len(begin):end_idx]
+
+
+def _fextr(s: str, begin: str, end: str, pos: int = 0) -> str | None:
+    """Extract string between first occurrence of begin..end after pos."""
+    start = s.find(begin, pos)
+    if start < 0:
+        return None
+    start += len(begin)
+    stop = s.find(end, start)
+    if stop < 0:
+        return None
+    return s[start:stop]
+
+
 async def parse_anim_idx(text: str) -> list[int]:
+    # New format: "ondemand.s" is a value in a name map, hash lives in a second
+    # map under the same numeric key further in the HTML.
+    ondemand_pos = text.find('"ondemand.s"')
+    if ondemand_pos >= 0:
+        ondemand_key = _rextr(text, ",", ":", ondemand_pos)
+        if ondemand_key:
+            ondemand_s = _fextr(text, ondemand_key + ':"', '"', ondemand_pos)
+            if ondemand_s:
+                url = script_url("ondemand.s", f"{ondemand_s}a")
+                js_text = await get_tw_page_text(url)
+                items = [int(x.group(2)) for x in INDICES_REGEX.finditer(js_text)]
+                if items:
+                    return items
+
+    # Fallback: old format where the chunk map contains ondemand.s as a key.
     scripts = list(get_scripts_list(text))
-    scripts = [x for x in scripts if "/ondemand.s." in x]
-    if not scripts:
+    candidates = [x for x in scripts if "/ondemand.s." in x]
+    if not candidates:
         raise Exception("Couldn't get XClientTxId scripts")
 
-    text = await get_tw_page_text(scripts[0])
-
-    items = [int(x.group(2)) for x in INDICES_REGEX.finditer(text)]
+    js_text = await get_tw_page_text(candidates[0])
+    items = [int(x.group(2)) for x in INDICES_REGEX.finditer(js_text)]
     if not items:
         raise Exception("Couldn't get XClientTxId indices")
 
